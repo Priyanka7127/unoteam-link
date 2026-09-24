@@ -1,0 +1,267 @@
+"""
+report_builder.py — turns crawl results into the same audit workbook
+structure used throughout this engagement: Summary, Treatments, Blogs,
+Case Studies tabs, no Category column, an honest Indexed? column,
+and cross-type Scope recommendations for every orphan page.
+"""
+from io import BytesIO
+from urllib.parse import urlparse
+
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+import crawler_core as cc
+
+FONT_NAME = "Arial"
+HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+HEADER_FONT = Font(name=FONT_NAME, bold=True, color="FFFFFF", size=10)
+TITLE_FONT = Font(name=FONT_NAME, bold=True, size=14, color="1F4E78")
+SUBTITLE_FONT = Font(name=FONT_NAME, italic=True, size=9, color="595959")
+WRAP = Alignment(wrap_text=True, vertical="top", horizontal="left")
+WRAP_C = Alignment(wrap_text=True, vertical="top", horizontal="center")
+THIN = Side(style="thin", color="D9D9D9")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+RED_FILL = PatternFill(start_color="FCE4E4", end_color="FCE4E4", fill_type="solid")
+YELLOW_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+GREEN_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+LIGHT_FILL = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+
+
+def _style_header(ws, row, ncols):
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row=row, column=c)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = WRAP_C
+        cell.border = BORDER
+
+
+def _style_row(ws, row, ncols, fill=None):
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row=row, column=c)
+        cell.font = Font(name=FONT_NAME, size=9.5)
+        cell.alignment = WRAP
+        cell.border = BORDER
+        if fill:
+            cell.fill = fill
+
+
+def _set_widths(ws, widths):
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def _title_block(ws, title, subtitle, ncols, sub_height=40):
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    ws["A1"] = title
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncols)
+    ws["A2"] = subtitle
+    ws["A2"].font = SUBTITLE_FONT
+    ws.row_dimensions[1].height = 22
+    ws.row_dimensions[2].height = sub_height
+
+
+def _format_scope(recs):
+    if not recs:
+        return "No topically similar page found automatically — review manually."
+    parts = []
+    for score, url, title, category in recs:
+        parts.append(f"[{category}] \"{title}\" ({url}) — similarity {score:.2f}")
+    return "Consider adding a link from: " + "; ".join(parts)
+
+
+def find_broken_links(pages: dict, inbound: dict):
+    """Pages that were linked to but returned a non-200 status or failed
+    outright — real broken-link findings, not content to list as pages."""
+    broken = []
+    for url, data in pages.items():
+        if data.get("error") or (data.get("status") is not None and data["status"] != 200):
+            sources = inbound.get(url, [])
+            broken.append({
+                "url": url,
+                "status": data.get("status"),
+                "error": data.get("error"),
+                "linked_from": sources,
+            })
+    return broken
+
+
+def _make_category_sheet(wb, sheet_name, title, subtitle, pages, inbound, category_keys):
+    rows = {u: d for u, d in pages.items()
+            if d["category"] in category_keys and d.get("status") == 200}
+    ws = wb.create_sheet(sheet_name)
+    headers = ["#", "Page Title", "URL", "Current Inbound Links",
+               "Linking Page(s) & Anchor Text", "Orphan?", "Indexed?",
+               "Scope: Recommended Links to Add (auto-computed by text similarity, any page type)"]
+    _title_block(ws, title, subtitle, len(headers))
+    hr = 3
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=hr, column=i, value=h)
+    _style_header(ws, hr, len(headers))
+    ws.freeze_panes = f"A{hr + 1}"
+
+    r = hr + 1
+    for idx, (url, data) in enumerate(sorted(rows.items(), key=lambda kv: kv[1]["title"]), start=1):
+        links_in = inbound.get(url, [])
+        count = len(links_in)
+        evidence = "; ".join(f"{s['source']} → \"{s['anchor_text']}\"" for s in links_in) or "None found in this crawl."
+        is_orphan = "YES" if count == 0 else "No"
+        indexed = "Not checked (requires Google Search Console or manual check — see Summary tab)"
+        scope = ""
+        if count == 0:
+            recs = cc.recommend_sources_for_orphan(url, pages, top_n=5)
+            scope = _format_scope(recs)
+        else:
+            scope = "Has inbound links already — still worth adding more from topically related pages if available."
+        row_vals = [idx, data["title"], url, count, evidence, is_orphan, indexed, scope]
+        for c, v in enumerate(row_vals, start=1):
+            ws.cell(row=r, column=c, value=v)
+        fill = RED_FILL if count == 0 else (YELLOW_FILL if count <= 1 else GREEN_FILL)
+        _style_row(ws, r, len(headers), fill=fill)
+        ws.cell(row=r, column=1).alignment = WRAP_C
+        ws.cell(row=r, column=4).alignment = WRAP_C
+        ws.cell(row=r, column=6).alignment = WRAP_C
+        r += 1
+
+    _set_widths(ws, [4, 30, 34, 12, 46, 8, 20, 56])
+    for row in ws.iter_rows(min_row=hr + 1, max_row=r - 1):
+        ws.row_dimensions[row[0].row].height = 60
+    if r > hr + 1:
+        ws.auto_filter.ref = f"A{hr}:H{r - 1}"
+    return len(rows), sum(1 for u in rows if len(inbound.get(u, [])) == 0)
+
+
+def build_workbook(pages: dict, selected: dict, site_url: str) -> BytesIO:
+    """selected: {'content': bool, 'blog': bool, 'case_study': bool}"""
+    inbound = cc.build_inbound_index(pages)
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    stats = {}
+
+    if selected.get("content"):
+        n, orphans = _make_category_sheet(
+            wb, "Treatments-Services", "Treatments / Service Pages — Internal Linking Audit",
+            f"Crawled from {site_url}. 'Current Inbound Links' counts contextual body links only "
+            "(the site's repeating nav menu and footer are excluded, since those appear on every "
+            "page and don't reflect real topical relevance). Scope recommendations for orphan pages "
+            "(0 inbound links) are computed automatically by text similarity across ALL crawled "
+            "pages regardless of type — a blog post or case study can be recommended as a source for "
+            "a service page, and vice versa.",
+            pages, inbound, {"content"})
+        stats["Treatments/Services"] = (n, orphans)
+
+    if selected.get("blog"):
+        n, orphans = _make_category_sheet(
+            wb, "Blogs", "Blogs — Cross-Linking Audit",
+            f"Crawled from {site_url}. Same methodology as the Treatments tab: contextual links only, "
+            "cross-type recommendations for any post with zero inbound links.",
+            pages, inbound, {"blog"})
+        stats["Blogs"] = (n, orphans)
+
+    if selected.get("case_study"):
+        n, orphans = _make_category_sheet(
+            wb, "Case Studies", "Case Studies — Cross-Linking Audit",
+            f"Crawled from {site_url}. Same methodology as the other tabs.",
+            pages, inbound, {"case_study"})
+        stats["Case Studies"] = (n, orphans)
+
+    # --- Broken Links sheet ---
+    broken = find_broken_links(pages, inbound)
+    if broken:
+        ws_b = wb.create_sheet("Broken Links")
+        headers_b = ["#", "Broken URL", "Status / Error", "Linked From (page → anchor text)"]
+        _title_block(ws_b, "Broken Internal Links Found",
+                      f"Crawled from {site_url}. These are links this crawl followed that did not "
+                      "return a working page (404, error, or non-HTML response) — each one is real "
+                      "link equity currently going nowhere.",
+                      len(headers_b))
+        hr_b = 3
+        for i, h in enumerate(headers_b, start=1):
+            ws_b.cell(row=hr_b, column=i, value=h)
+        _style_header(ws_b, hr_b, len(headers_b))
+        ws_b.freeze_panes = f"A{hr_b + 1}"
+        r = hr_b + 1
+        for idx, item in enumerate(broken, start=1):
+            status_txt = item["error"] or f"HTTP {item['status']}"
+            sources_txt = "; ".join(f"{s['source']} → \"{s['anchor_text']}\"" for s in item["linked_from"]) or "(only reached via nav/footer or another broken page)"
+            for c, v in enumerate([idx, item["url"], status_txt, sources_txt], start=1):
+                ws_b.cell(row=r, column=c, value=v)
+            _style_row(ws_b, r, len(headers_b), fill=RED_FILL)
+            ws_b.cell(row=r, column=1).alignment = WRAP_C
+            r += 1
+        _set_widths(ws_b, [4, 40, 20, 60])
+        for row in ws_b.iter_rows(min_row=hr_b + 1, max_row=r - 1):
+            ws_b.row_dimensions[row[0].row].height = 40
+        ws_b.auto_filter.ref = f"A{hr_b}:D{r - 1}"
+
+    # --- Summary sheet (inserted first) ---
+    ws = wb.create_sheet("Summary", 0)
+    ws.sheet_view.showGridLines = False
+    _set_widths(ws, [3, 46, 16, 46, 16])
+    row = 1
+    ws.merge_cells(f"A{row}:E{row}")
+    ws.cell(row=row, column=1, value="Internal Linking Audit — Summary").font = TITLE_FONT
+    row += 1
+    ws.merge_cells(f"A{row}:E{row}")
+    ws.cell(row=row, column=1, value=f"Site: {site_url}").font = SUBTITLE_FONT
+    row += 2
+
+    def section(title, r):
+        ws.merge_cells(f"A{r}:E{r}")
+        c = ws.cell(row=r, column=1, value=title)
+        c.font = Font(name=FONT_NAME, bold=True, size=12, color="1F4E78")
+        c.fill = LIGHT_FILL
+        for col in range(1, 6):
+            ws.cell(row=r, column=col).fill = LIGHT_FILL
+            ws.cell(row=r, column=col).border = BORDER
+        return r + 1
+
+    def kv(r, label, value):
+        ws.cell(row=r, column=2, value=label).font = Font(name=FONT_NAME, size=10)
+        ws.cell(row=r, column=2).alignment = WRAP
+        ws.cell(row=r, column=4, value=value).font = Font(name=FONT_NAME, size=10, bold=True)
+        ws.cell(row=r, column=4).alignment = WRAP_C
+        for col in [2, 3, 4, 5]:
+            ws.cell(row=r, column=col).border = BORDER
+        return r + 1
+
+    row = section("Site Inventory (this crawl)", row)
+    row = kv(row, "Total pages crawled", str(len(pages)))
+    for label, (n, orphans) in stats.items():
+        row = kv(row, f"{label} pages found", str(n))
+        row = kv(row, f"{label} pages with 0 inbound links (orphans)", str(orphans))
+    row = kv(row, "Broken internal links found", str(len(broken)))
+    row += 1
+
+    row = section("Methodology & Honest Limitations", row)
+    ws.merge_cells(f"A{row}:E{row + 9}")
+    note = (
+        "This report was generated by an automated crawler running from your own computer, not a "
+        "browser page — it made real HTTP requests to every page it found on the site, up to the "
+        "page limit you set, following links breadth-first from the homepage.\n\n"
+        "'Inbound links' counts only contextual links found in the page body; the site's repeating "
+        "navigation menu and footer are excluded on purpose. A page is flagged an orphan only if this "
+        "crawl found zero contextual links to it — if the crawl hit its page limit before reaching "
+        "every corner of the site, some 'orphans' may actually have inbound links from pages that "
+        "weren't reached this time. Increase the page limit and re-run for full confidence on a large site.\n\n"
+        "Scope recommendations are computed by simple keyword-overlap similarity between page titles "
+        "and text, not by a human reading each page — they are candidates worth reviewing, not "
+        "guaranteed-correct editorial judgments. On short or very generic pages this heuristic is "
+        "weaker; treat low-similarity-score suggestions with more skepticism than high-scoring ones.\n\n"
+        "'Indexed?' is not automatically checked — that requires either Google Search Console access "
+        "for this site, or manually searching 'site:yourdomain.com/the-url' in Google. This tool "
+        "doesn't scrape Google search results, since that violates Google's terms of service."
+    )
+    cell = ws.cell(row=row, column=1, value=note)
+    cell.font = Font(name=FONT_NAME, size=9.5, italic=True)
+    cell.alignment = WRAP
+    ws.row_dimensions[1].height = 26
+    ws.row_dimensions[2].height = 18
+
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
