@@ -67,16 +67,31 @@ def _title_block(ws, title, subtitle, ncols, sub_height=40):
     ws.row_dimensions[2].height = sub_height
 
 
+def _clean_anchor_text(title: str) -> str:
+    """Turn a raw <title> into anchor-ready text: drop the trailing
+    '| Brand Name' / '- Brand Name' boilerplate that page titles carry,
+    so the suggested anchor reads naturally instead of a whole SEO title."""
+    if not title:
+        return title
+    for sep in (" | ", " — ", " – ", " - "):
+        if sep in title:
+            head = title.split(sep)[0].strip()
+            if len(head) >= 8:  # avoid chopping down to something too short/generic
+                return head
+    return title.strip()
+
+
 def _format_scope(recs, target_title):
     """Build the Scope cell as rich text: plain-text recommendation details
-    with the suggested anchor text (the orphan page's own title — the most
-    relevant phrase to link it with) bolded inline."""
+    with the suggested anchor text (the orphan page's own cleaned title —
+    the most relevant phrase to link it with) bolded inline, per URL."""
     if not recs:
         return "No topically similar page found automatically — review manually."
+    anchor = _clean_anchor_text(target_title)
     pieces = ["Consider adding links from:"]
     for score, url, title, category in recs:
         pieces.append(f"\n[{category}] \"{title}\" ({url}) — score {score:.2f} — anchor text: ")
-        pieces.append(TextBlock(BOLD_INLINE, target_title))
+        pieces.append(TextBlock(BOLD_INLINE, anchor))
     return CellRichText(pieces)
 
 
@@ -142,6 +157,62 @@ def _make_category_sheet(wb, sheet_name, title, subtitle, pages, inbound, catego
     return len(rows), sum(1 for u in rows if len(inbound.get(u, [])) == 0)
 
 
+def _make_homepage_link_sheet(wb, pages, inbound, site_url, selected):
+    """Every page on the site should carry at least one contextual (non-nav)
+    link back to the homepage — it's the page most worth reinforcing. This
+    sheet flags every audited page that currently doesn't."""
+    home_url = next((u for u, d in pages.items() if d["category"] == "home" and d.get("status") == 200), None)
+    if home_url is None:
+        return None, 0, 0
+    home_anchor = "Home"
+    linked_sources = {s["source"] for s in inbound.get(home_url, [])}
+
+    wanted_cats = {cat for cat, on in
+                   (("content", selected.get("content")), ("blog", selected.get("blog")),
+                    ("case_study", selected.get("case_study"))) if on}
+    rows = {u: d for u, d in pages.items()
+            if d["category"] in wanted_cats and d.get("status") == 200 and u != home_url}
+
+    ws = wb.create_sheet("Homepage Linking")
+    headers = ["#", "Page Title", "URL", "Links to Home?", "Suggested Anchor Text"]
+    _title_block(ws, "Homepage Internal Linking Check",
+                  f"Crawled from {site_url}. Every page on a site should carry at least one contextual "
+                  "body link back to the homepage — it consolidates link equity on the page you most "
+                  "want to rank and helps users/crawlers navigate back. This checks contextual "
+                  "(non-nav/footer) links only, same methodology as the other tabs.",
+                  len(headers))
+    hr = 3
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=hr, column=i, value=h)
+    _style_header(ws, hr, len(headers))
+    ws.freeze_panes = f"A{hr + 1}"
+
+    r = hr + 1
+    missing = 0
+    for idx, (url, data) in enumerate(sorted(rows.items(), key=lambda kv: kv[1]["title"]), start=1):
+        has_link = url in linked_sources
+        if not has_link:
+            missing += 1
+        row_vals = [idx, data["title"], url, "Yes" if has_link else "NO",
+                    "" if has_link else home_anchor]
+        for c, v in enumerate(row_vals, start=1):
+            ws.cell(row=r, column=c, value=v)
+        if not has_link:
+            ws.cell(row=r, column=5).font = Font(name=FONT_NAME, size=9.5, bold=True)
+        fill = GREEN_FILL if has_link else RED_FILL
+        _style_row(ws, r, len(headers), fill=fill)
+        ws.cell(row=r, column=1).alignment = WRAP_C
+        ws.cell(row=r, column=4).alignment = WRAP_C
+        r += 1
+
+    _set_widths(ws, [4, 34, 40, 14, 24])
+    for row in ws.iter_rows(min_row=hr + 1, max_row=r - 1):
+        ws.row_dimensions[row[0].row].height = 30
+    if r > hr + 1:
+        ws.auto_filter.ref = f"A{hr}:E{r - 1}"
+    return home_url, len(rows), missing
+
+
 def build_workbook(pages: dict, selected: dict, site_url: str) -> BytesIO:
     """selected: {'content': bool, 'blog': bool, 'case_study': bool}"""
     inbound = cc.build_inbound_index(pages)
@@ -176,6 +247,9 @@ def build_workbook(pages: dict, selected: dict, site_url: str) -> BytesIO:
             f"Crawled from {site_url}. Same methodology as the other tabs.",
             pages, inbound, {"case_study"})
         stats["Case Studies"] = (n, orphans)
+
+    # --- Homepage Linking sheet ---
+    home_url, home_checked, home_missing = _make_homepage_link_sheet(wb, pages, inbound, site_url, selected)
 
     # --- Broken Links sheet ---
     broken = find_broken_links(pages, inbound)
@@ -243,6 +317,9 @@ def build_workbook(pages: dict, selected: dict, site_url: str) -> BytesIO:
         row = kv(row, f"{label} pages found", str(n))
         row = kv(row, f"{label} pages with 0 inbound links (orphans)", str(orphans))
     row = kv(row, "Broken internal links found", str(len(broken)))
+    if home_url is not None:
+        row = kv(row, "Pages checked for a homepage link", str(home_checked))
+        row = kv(row, "Pages missing a contextual link to homepage", str(home_missing))
     row += 1
 
     row = section("Methodology & Honest Limitations", row)
@@ -260,8 +337,12 @@ def build_workbook(pages: dict, selected: dict, site_url: str) -> BytesIO:
         "and text, not by a human reading each page — they are candidates worth reviewing, not "
         "guaranteed-correct editorial judgments. The 'Score' column is that similarity value (0–1, "
         "highest-scoring recommendation shown) — treat low scores with more skepticism than high ones. "
-        "The suggested anchor text in bold within the Scope column is the orphan page's own title, "
-        "the most relevant phrase to use when adding the new link."
+        "The suggested anchor text in bold within the Scope column is the orphan page's own cleaned "
+        "title (SEO-suffix like '| Brand Name' stripped), the most relevant phrase to use when adding "
+        "the new link.\n\n"
+        "The Homepage Linking tab checks every audited page for at least one contextual (non-nav) link "
+        "back to the homepage — this consolidates link equity on your most important page. Any page "
+        "marked NO should get a link added, using the suggested anchor text shown."
     )
     cell = ws.cell(row=row, column=1, value=note)
     cell.font = Font(name=FONT_NAME, size=9.5, italic=True)
