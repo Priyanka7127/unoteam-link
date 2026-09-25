@@ -1,8 +1,9 @@
 """
 report_builder.py — turns crawl results into the same audit workbook
 structure used throughout this engagement: Summary, Treatments, Blogs,
-Case Studies tabs, no Category column, an honest Indexed? column,
-and cross-type Scope recommendations for every orphan page.
+Case Studies tabs, no Category column, a Score column showing the
+similarity strength behind each recommendation, and cross-type Scope
+recommendations (with a bolded suggested anchor text) for every orphan page.
 """
 from io import BytesIO
 from urllib.parse import urlparse
@@ -10,6 +11,8 @@ from urllib.parse import urlparse
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.cell.text import InlineFont
+from openpyxl.cell.rich_text import TextBlock, CellRichText
 
 import crawler_core as cc
 
@@ -26,6 +29,7 @@ RED_FILL = PatternFill(start_color="FCE4E4", end_color="FCE4E4", fill_type="soli
 YELLOW_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 GREEN_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
 LIGHT_FILL = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+BOLD_INLINE = InlineFont(rFont=FONT_NAME, sz=9.5, b=True)
 
 
 def _style_header(ws, row, ncols):
@@ -63,13 +67,17 @@ def _title_block(ws, title, subtitle, ncols, sub_height=40):
     ws.row_dimensions[2].height = sub_height
 
 
-def _format_scope(recs):
+def _format_scope(recs, target_title):
+    """Build the Scope cell as rich text: plain-text recommendation details
+    with the suggested anchor text (the orphan page's own title — the most
+    relevant phrase to link it with) bolded inline."""
     if not recs:
         return "No topically similar page found automatically — review manually."
-    parts = []
+    pieces = ["Consider adding links from:"]
     for score, url, title, category in recs:
-        parts.append(f"[{category}] \"{title}\" ({url}) — similarity {score:.2f}")
-    return "Consider adding a link from: " + "; ".join(parts)
+        pieces.append(f"\n[{category}] \"{title}\" ({url}) — score {score:.2f} — anchor text: ")
+        pieces.append(TextBlock(BOLD_INLINE, target_title))
+    return CellRichText(pieces)
 
 
 def find_broken_links(pages: dict, inbound: dict):
@@ -93,7 +101,7 @@ def _make_category_sheet(wb, sheet_name, title, subtitle, pages, inbound, catego
             if d["category"] in category_keys and d.get("status") == 200}
     ws = wb.create_sheet(sheet_name)
     headers = ["#", "Page Title", "URL", "Current Inbound Links",
-               "Linking Page(s) & Anchor Text", "Orphan?", "Indexed?",
+               "Linking Page(s) & Anchor Text", "Orphan?", "Score",
                "Scope: Recommended Links to Add (auto-computed by text similarity, any page type)"]
     _title_block(ws, title, subtitle, len(headers))
     hr = 3
@@ -108,14 +116,14 @@ def _make_category_sheet(wb, sheet_name, title, subtitle, pages, inbound, catego
         count = len(links_in)
         evidence = "; ".join(f"{s['source']} → \"{s['anchor_text']}\"" for s in links_in) or "None found in this crawl."
         is_orphan = "YES" if count == 0 else "No"
-        indexed = "Not checked (requires Google Search Console or manual check — see Summary tab)"
-        scope = ""
+        score = ""
         if count == 0:
             recs = cc.recommend_sources_for_orphan(url, pages, top_n=5)
-            scope = _format_scope(recs)
+            score = round(recs[0][0], 2) if recs else 0
+            scope = _format_scope(recs, data["title"])
         else:
             scope = "Has inbound links already — still worth adding more from topically related pages if available."
-        row_vals = [idx, data["title"], url, count, evidence, is_orphan, indexed, scope]
+        row_vals = [idx, data["title"], url, count, evidence, is_orphan, score, scope]
         for c, v in enumerate(row_vals, start=1):
             ws.cell(row=r, column=c, value=v)
         fill = RED_FILL if count == 0 else (YELLOW_FILL if count <= 1 else GREEN_FILL)
@@ -123,9 +131,10 @@ def _make_category_sheet(wb, sheet_name, title, subtitle, pages, inbound, catego
         ws.cell(row=r, column=1).alignment = WRAP_C
         ws.cell(row=r, column=4).alignment = WRAP_C
         ws.cell(row=r, column=6).alignment = WRAP_C
+        ws.cell(row=r, column=7).alignment = WRAP_C
         r += 1
 
-    _set_widths(ws, [4, 30, 34, 12, 46, 8, 20, 56])
+    _set_widths(ws, [4, 30, 34, 12, 46, 8, 10, 56])
     for row in ws.iter_rows(min_row=hr + 1, max_row=r - 1):
         ws.row_dimensions[row[0].row].height = 60
     if r > hr + 1:
@@ -249,11 +258,10 @@ def build_workbook(pages: dict, selected: dict, site_url: str) -> BytesIO:
         "weren't reached this time. Increase the page limit and re-run for full confidence on a large site.\n\n"
         "Scope recommendations are computed by simple keyword-overlap similarity between page titles "
         "and text, not by a human reading each page — they are candidates worth reviewing, not "
-        "guaranteed-correct editorial judgments. On short or very generic pages this heuristic is "
-        "weaker; treat low-similarity-score suggestions with more skepticism than high-scoring ones.\n\n"
-        "'Indexed?' is not automatically checked — that requires either Google Search Console access "
-        "for this site, or manually searching 'site:yourdomain.com/the-url' in Google. This tool "
-        "doesn't scrape Google search results, since that violates Google's terms of service."
+        "guaranteed-correct editorial judgments. The 'Score' column is that similarity value (0–1, "
+        "highest-scoring recommendation shown) — treat low scores with more skepticism than high ones. "
+        "The suggested anchor text in bold within the Scope column is the orphan page's own title, "
+        "the most relevant phrase to use when adding the new link."
     )
     cell = ws.cell(row=row, column=1, value=note)
     cell.font = Font(name=FONT_NAME, size=9.5, italic=True)
