@@ -5,6 +5,7 @@ Case Studies tabs, no Category column, a Score column showing the
 similarity strength behind each recommendation, and cross-type Scope
 recommendations (with a bolded suggested anchor text) for every orphan page.
 """
+import re
 from io import BytesIO
 from urllib.parse import urlparse
 
@@ -81,15 +82,39 @@ def _clean_anchor_text(title: str) -> str:
     return title.strip()
 
 
+_LOCATION_SUFFIX_RE = re.compile(
+    r"\s+(?:in|for|near)\s+[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2}$"
+)
+
+
+def _shorten_phrase(title: str) -> str:
+    """Drop a trailing ' in <City>' / ' for <Place>' geo-suffix so the core
+    topic phrase stays short — SEO anchor text should be a small, natural
+    phrase, not a whole keyword-stuffed page title."""
+    cleaned = _clean_anchor_text(title)
+    shortened = _LOCATION_SUFFIX_RE.sub("", cleaned).strip()
+    return shortened or cleaned
+
+
+def _anchor_variants(title: str):
+    """A small rotation of natural, short anchor phrasings for the same
+    target page — using one identical exact-match anchor on every single
+    recommended link looks manipulative to Google; real internal-linking
+    profiles vary anchor text (exact/partial-match, natural mentions)."""
+    base = _shorten_phrase(title)
+    return [base, base.lower(), f"more on {base.lower()}"]
+
+
 def _format_scope(recs, target_title):
     """Build the Scope cell as rich text: plain-text recommendation details
-    with the suggested anchor text (the orphan page's own cleaned title —
-    the most relevant phrase to link it with) bolded inline, per URL."""
+    with a short, naturally varied suggested anchor text bolded inline per URL —
+    not the same exact-match full title repeated on every recommendation."""
     if not recs:
         return "No topically similar page found automatically — review manually."
-    anchor = _clean_anchor_text(target_title)
+    variants = _anchor_variants(target_title)
     pieces = ["Consider adding links from:"]
-    for score, url, title, category in recs:
+    for i, (score, url, title, category) in enumerate(recs):
+        anchor = variants[i % len(variants)]
         pieces.append(f"\n[{category}] \"{title}\" ({url}) — score {score:.2f} — anchor text: ")
         pieces.append(TextBlock(BOLD_INLINE, anchor))
     return CellRichText(pieces)
