@@ -275,20 +275,54 @@ def similarity(a_tokens: set, b_tokens: set) -> float:
     return inter / union if union else 0.0
 
 
-def recommend_sources_for_orphan(target_url, pages, top_n=5):
-    """Find the top_n most topically-similar OTHER pages (any category) to
-    recommend as new inbound-link sources for an orphan page."""
+MIN_RELEVANCE_SCORE = 0.10  # floor below which a candidate is not "relevant
+                             # enough" to recommend — never padded past this
+                             # just to hit a target link count.
+SAME_CATEGORY_PENALTY = 0.5  # a transactional/service page doesn't need to
+                              # be linked from another service page; a
+                              # topically related blog post or case study is
+                              # usually the more natural, honest link. This
+                              # only nudges ranking order for content→content
+                              # candidates — it never overrides genuine
+                              # relevance (the min-score floor still applies
+                              # to the real similarity score, not this key).
+
+
+def recommend_link_sources(target_url, pages, top_n=5, exclude_urls=None,
+                            min_score=MIN_RELEVANCE_SCORE):
+    """Find up to top_n topically-relevant OTHER pages to recommend as new
+    inbound-link sources for target_url.
+
+    Only candidates whose real similarity score clears min_score are
+    returned — if fewer than top_n pages are genuinely relevant, fewer are
+    returned rather than padding the list with unrelated pages.
+
+    Cross-type intelligence: when target_url is a transactional/service
+    ('content') page, another 'content' page is still eligible but is
+    ranked behind an equally-or-less-relevant blog/case-study candidate,
+    since service pages should preferentially link out to relevant content
+    (blogs, case studies) rather than to each other.
+    """
     target = pages[target_url]
+    target_category = target["category"]
     target_tokens = _tokenize(target["title"] + " " + target["text_sample"])
+    exclude_urls = exclude_urls or set()
+
     scored = []
     for url, data in pages.items():
-        if url == target_url:
+        if url == target_url or url in exclude_urls:
             continue
         if data["category"] in ("utility", "home", "about"):
             continue
+        if data.get("status") != 200:
+            continue
         tokens = _tokenize(data["title"] + " " + data["text_sample"])
         score = similarity(target_tokens, tokens)
-        if score > 0:
-            scored.append((score, url, data["title"], data["category"]))
-    scored.sort(reverse=True)
-    return scored[:top_n]
+        if score < min_score:
+            continue
+        same_category = target_category == "content" and data["category"] == "content"
+        rank_key = score * SAME_CATEGORY_PENALTY if same_category else score
+        scored.append((rank_key, score, url, data["title"], data["category"]))
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [(score, url, title, category) for _, score, url, title, category in scored[:top_n]]

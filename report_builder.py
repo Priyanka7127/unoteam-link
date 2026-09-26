@@ -105,14 +105,25 @@ def _anchor_variants(title: str):
     return [base, base.lower(), f"more on {base.lower()}"]
 
 
-def _format_scope(recs, target_title):
+def _format_scope(recs, target_title, needed=None):
     """Build the Scope cell as rich text: plain-text recommendation details
     with a short, naturally varied suggested anchor text bolded inline per URL —
-    not the same exact-match full title repeated on every recommendation."""
+    not the same exact-match full title repeated on every recommendation.
+    If fewer relevant candidates exist than are needed to close the gap,
+    say so explicitly rather than silently padding with weaker matches."""
     if not recs:
-        return "No topically similar page found automatically — review manually."
+        note = "No sufficiently relevant page found automatically."
+        if needed:
+            note += f" This page still needs {needed} more link(s) to reach its target — review manually rather than adding an unrelated link just to hit the count."
+        else:
+            note += " Review manually."
+        return note
     variants = _anchor_variants(target_title)
-    pieces = ["Consider adding links from:"]
+    header = "Consider adding links from:"
+    if needed is not None and len(recs) < needed:
+        header += (f" (only {len(recs)} sufficiently relevant page(s) found — fewer than the "
+                   f"{needed} needed to close the gap; don't pad with unrelated pages)")
+    pieces = [header]
     for i, (score, url, title, category) in enumerate(recs):
         anchor = variants[i % len(variants)]
         pieces.append(f"\n[{category}] \"{title}\" ({url}) — score {score:.2f} — anchor text: ")
@@ -136,13 +147,13 @@ def find_broken_links(pages: dict, inbound: dict):
     return broken
 
 
-def _make_category_sheet(wb, sheet_name, title, subtitle, pages, inbound, category_keys):
+def _make_category_sheet(wb, sheet_name, title, subtitle, pages, inbound, category_keys, min_links):
     rows = {u: d for u, d in pages.items()
             if d["category"] in category_keys and d.get("status") == 200}
     ws = wb.create_sheet(sheet_name)
     headers = ["#", "Page Title", "URL", "Current Inbound Links",
-               "Linking Page(s) & Anchor Text", "Orphan?", "Score",
-               "Scope: Recommended Links to Add (auto-computed by text similarity, any page type)"]
+               "Linking Page(s) & Anchor Text", f"Links Needed (target: {min_links})", "Score",
+               "Scope: Recommended Links to Add (relevant only — never padded to hit a count)"]
     _title_block(ws, title, subtitle, len(headers))
     hr = 3
     for i, h in enumerate(headers, start=1):
@@ -151,22 +162,25 @@ def _make_category_sheet(wb, sheet_name, title, subtitle, pages, inbound, catego
     ws.freeze_panes = f"A{hr + 1}"
 
     r = hr + 1
+    below_target = 0
     for idx, (url, data) in enumerate(sorted(rows.items(), key=lambda kv: kv[1]["title"]), start=1):
         links_in = inbound.get(url, [])
         count = len(links_in)
         evidence = "; ".join(f"{s['source']} → \"{s['anchor_text']}\"" for s in links_in) or "None found in this crawl."
-        is_orphan = "YES" if count == 0 else "No"
+        needed = max(0, min_links - count)
         score = ""
-        if count == 0:
-            recs = cc.recommend_sources_for_orphan(url, pages, top_n=5)
+        if needed > 0:
+            below_target += 1
+            existing_sources = {s["source"] for s in links_in}
+            recs = cc.recommend_link_sources(url, pages, top_n=needed, exclude_urls=existing_sources)
             score = round(recs[0][0], 2) if recs else 0
-            scope = _format_scope(recs, data["title"])
+            scope = _format_scope(recs, data["title"], needed=needed)
         else:
-            scope = "Has inbound links already — still worth adding more from topically related pages if available."
-        row_vals = [idx, data["title"], url, count, evidence, is_orphan, score, scope]
+            scope = f"Already has {count} inbound link(s), meeting the {min_links}-link target for this page type."
+        row_vals = [idx, data["title"], url, count, evidence, needed, score, scope]
         for c, v in enumerate(row_vals, start=1):
             ws.cell(row=r, column=c, value=v)
-        fill = RED_FILL if count == 0 else (YELLOW_FILL if count <= 1 else GREEN_FILL)
+        fill = RED_FILL if count == 0 else (YELLOW_FILL if needed > 0 else GREEN_FILL)
         _style_row(ws, r, len(headers), fill=fill)
         ws.cell(row=r, column=1).alignment = WRAP_C
         ws.cell(row=r, column=4).alignment = WRAP_C
@@ -174,12 +188,12 @@ def _make_category_sheet(wb, sheet_name, title, subtitle, pages, inbound, catego
         ws.cell(row=r, column=7).alignment = WRAP_C
         r += 1
 
-    _set_widths(ws, [4, 30, 34, 12, 46, 8, 10, 56])
+    _set_widths(ws, [4, 30, 34, 12, 46, 12, 10, 56])
     for row in ws.iter_rows(min_row=hr + 1, max_row=r - 1):
         ws.row_dimensions[row[0].row].height = 60
     if r > hr + 1:
         ws.auto_filter.ref = f"A{hr}:H{r - 1}"
-    return len(rows), sum(1 for u in rows if len(inbound.get(u, [])) == 0)
+    return len(rows), below_target
 
 
 def _make_homepage_link_sheet(wb, pages, inbound, site_url, selected):
@@ -245,33 +259,39 @@ def build_workbook(pages: dict, selected: dict, site_url: str) -> BytesIO:
     wb.remove(wb.active)
 
     stats = {}
+    LINK_TARGETS = {"content": 10, "blog": 4, "case_study": 4}
 
     if selected.get("content"):
-        n, orphans = _make_category_sheet(
+        n, below = _make_category_sheet(
             wb, "Treatments-Services", "Treatments / Service Pages — Internal Linking Audit",
             f"Crawled from {site_url}. 'Current Inbound Links' counts contextual body links only "
             "(the site's repeating nav menu and footer are excluded, since those appear on every "
-            "page and don't reflect real topical relevance). Scope recommendations for orphan pages "
-            "(0 inbound links) are computed automatically by text similarity across ALL crawled "
-            "pages regardless of type — a blog post or case study can be recommended as a source for "
-            "a service page, and vice versa.",
-            pages, inbound, {"content"})
-        stats["Treatments/Services"] = (n, orphans)
+            "page and don't reflect real topical relevance). Target: {n} inbound links per service "
+            "page. Any page below that gets ONLY genuinely relevant recommendations to close the gap "
+            "— never padded with unrelated pages just to hit the count. Service pages are "
+            "intentionally nudged toward linking from relevant blog posts or case studies rather than "
+            "other service pages (a service page doesn't need to link to another service page just "
+            "because it's the same type) — a same-type candidate is still used when it's the clearly "
+            "stronger match.".format(n=LINK_TARGETS["content"]),
+            pages, inbound, {"content"}, LINK_TARGETS["content"])
+        stats["Treatments/Services"] = (n, below)
 
     if selected.get("blog"):
-        n, orphans = _make_category_sheet(
+        n, below = _make_category_sheet(
             wb, "Blogs", "Blogs — Cross-Linking Audit",
             f"Crawled from {site_url}. Same methodology as the Treatments tab: contextual links only, "
-            "cross-type recommendations for any post with zero inbound links.",
-            pages, inbound, {"blog"})
-        stats["Blogs"] = (n, orphans)
+            f"target of {LINK_TARGETS['blog']} inbound links per post, cross-type recommendations "
+            "limited to genuinely relevant pages only.",
+            pages, inbound, {"blog"}, LINK_TARGETS["blog"])
+        stats["Blogs"] = (n, below)
 
     if selected.get("case_study"):
-        n, orphans = _make_category_sheet(
+        n, below = _make_category_sheet(
             wb, "Case Studies", "Case Studies — Cross-Linking Audit",
-            f"Crawled from {site_url}. Same methodology as the other tabs.",
-            pages, inbound, {"case_study"})
-        stats["Case Studies"] = (n, orphans)
+            f"Crawled from {site_url}. Same methodology as the other tabs, target of "
+            f"{LINK_TARGETS['case_study']} inbound links per case study.",
+            pages, inbound, {"case_study"}, LINK_TARGETS["case_study"])
+        stats["Case Studies"] = (n, below)
 
     # --- Homepage Linking sheet ---
     home_url, home_checked, home_missing = _make_homepage_link_sheet(wb, pages, inbound, site_url, selected)
@@ -338,9 +358,9 @@ def build_workbook(pages: dict, selected: dict, site_url: str) -> BytesIO:
 
     row = section("Site Inventory (this crawl)", row)
     row = kv(row, "Total pages crawled", str(len(pages)))
-    for label, (n, orphans) in stats.items():
+    for label, (n, below) in stats.items():
         row = kv(row, f"{label} pages found", str(n))
-        row = kv(row, f"{label} pages with 0 inbound links (orphans)", str(orphans))
+        row = kv(row, f"{label} pages below their inbound-link target", str(below))
     row = kv(row, "Broken internal links found", str(len(broken)))
     if home_url is not None:
         row = kv(row, "Pages checked for a homepage link", str(home_checked))
@@ -354,17 +374,25 @@ def build_workbook(pages: dict, selected: dict, site_url: str) -> BytesIO:
         "browser page — it made real HTTP requests to every page it found on the site, up to the "
         "page limit you set, following links breadth-first from the homepage.\n\n"
         "'Inbound links' counts only contextual links found in the page body; the site's repeating "
-        "navigation menu and footer are excluded on purpose. A page is flagged an orphan only if this "
-        "crawl found zero contextual links to it — if the crawl hit its page limit before reaching "
-        "every corner of the site, some 'orphans' may actually have inbound links from pages that "
-        "weren't reached this time. Increase the page limit and re-run for full confidence on a large site.\n\n"
+        "navigation menu and footer are excluded on purpose. If the crawl hit its page limit before "
+        "reaching every corner of the site, some pages below their link target may actually have "
+        "inbound links from pages that weren't reached this time. Increase the page limit and re-run "
+        "for full confidence on a large site.\n\n"
+        "Each page type has an inbound-link target: 10 for Treatments/Service pages, 4 for Blogs and "
+        "Case Studies. Any page below its target gets recommendations to close the gap — but ONLY "
+        "pages that clear a minimum topical-relevance score are ever recommended; if fewer relevant "
+        "pages exist than are needed, the report says so explicitly rather than padding the list with "
+        "unrelated pages. Service pages are intentionally nudged toward linking from a relevant blog "
+        "post or case study rather than another service page, since two service pages being the same "
+        "type doesn't make them a natural link pair — a same-type page is still recommended when it's "
+        "clearly the strongest match.\n\n"
         "Scope recommendations are computed by simple keyword-overlap similarity between page titles "
         "and text, not by a human reading each page — they are candidates worth reviewing, not "
-        "guaranteed-correct editorial judgments. The 'Score' column is that similarity value (0–1, "
-        "highest-scoring recommendation shown) — treat low scores with more skepticism than high ones. "
-        "The suggested anchor text in bold within the Scope column is the orphan page's own cleaned "
-        "title (SEO-suffix like '| Brand Name' stripped), the most relevant phrase to use when adding "
-        "the new link.\n\n"
+        "guaranteed-correct editorial judgments. The 'Score' column is the best recommendation's "
+        "similarity value (0–1) — treat low scores with more skepticism than high ones. The suggested "
+        "anchor text in bold within the Scope column is a short, cleaned phrase from the target page's "
+        "own title (SEO-suffix like '| Brand Name' and city/location suffixes stripped), varied across "
+        "recommendations rather than repeating one exact phrase on every link.\n\n"
         "The Homepage Linking tab checks every audited page for at least one contextual (non-nav) link "
         "back to the homepage — this consolidates link equity on your most important page. Any page "
         "marked NO should get a link added, using the suggested anchor text shown."
